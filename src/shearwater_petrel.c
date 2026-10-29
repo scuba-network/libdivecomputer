@@ -19,6 +19,13 @@
  * MA 02110-1301 USA
  */
 
+/*
+ * Changed by DSCNT on 29 October 2026 (scuba-network/app#1109): dives are
+ * downloaded oldest first, dives behind a deleted manifest record are kept,
+ * and deleted records are left out of the progress maximum. Each change is
+ * marked "DSCNT change" below.
+ */
+
 #include <string.h> // memcmp, memcpy
 #include <stdlib.h> // malloc, free
 
@@ -289,11 +296,17 @@ shearwater_petrel_device_foreach (dc_device_t *abstract, dc_dive_callback_t call
 		}
 
 		// Update the progress state.
+		// DSCNT change (#1109): deleted records are never downloaded, so
+		// they are left out of the maximum, which then ends at 100%.
 		current += 1;
-		maximum -= RECORD_COUNT - count - deleted;
+		maximum -= RECORD_COUNT - count;
 
 		// Append the manifest records to the main buffer.
-		if (!dc_buffer_append (manifests, data, count * RECORD_SIZE)) {
+		// DSCNT change (#1109): append every record the walk passed, which
+		// is offset bytes. Appending count records lost a dive at the end of
+		// the page for every deleted record before it. The deleted records
+		// themselves are skipped below.
+		if (!dc_buffer_append (manifests, data, offset)) {
 			ERROR (abstract->context, "Insufficient buffer space available.");
 			dc_buffer_free (buffer);
 			dc_buffer_free (manifests);
@@ -314,13 +327,19 @@ shearwater_petrel_device_foreach (dc_device_t *abstract, dc_dive_callback_t call
 	unsigned char *data = dc_buffer_get_data (manifests);
 	unsigned int size = dc_buffer_get_size (manifests);
 
-	unsigned int offset = 0;
-	while (offset < size) {
-		// skip deleted dives
-		if (array_uint16_be(data + offset) == 0x5A23) {
-			offset += RECORD_SIZE;
+	// DSCNT change (#1109): download the dives oldest first. The manifests
+	// were read newest first, which the fingerprint check above needs, so
+	// they are walked here from the end. A download that stops part way has
+	// then delivered the oldest dives without a gap, and the newest of them
+	// is a safe place for the next download to stop at.
+	unsigned int offset = size;
+	while (offset >= RECORD_SIZE) {
+		offset -= RECORD_SIZE;
+
+		// Skip deleted dives.
+		if (array_uint16_be (data + offset) == 0x5A23)
 			continue;
-		}
+
 		// Get the address of the dive.
 		unsigned int address = array_uint32_be (data + offset + 20);
 
@@ -342,8 +361,6 @@ shearwater_petrel_device_foreach (dc_device_t *abstract, dc_dive_callback_t call
 		unsigned int len = dc_buffer_get_size (buffer);
 		if (callback && !callback (buf, len, buf + 12, sizeof (device->fingerprint), userdata))
 			break;
-
-		offset += RECORD_SIZE;
 	}
 
 	// Update and emit a progress event.
