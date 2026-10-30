@@ -305,6 +305,7 @@
     <ClInclude Include="..\..\include\libdivecomputer\divesystem_idive.h" />
     <ClInclude Include="..\..\include\libdivecomputer\hw_ostc.h" />
     <ClInclude Include="..\..\include\libdivecomputer\hw_ostc3.h" />
+    <ClInclude Include="..\..\include\libdivecomputer\shearwater_petrel.h" />
     <ClInclude Include="..\..\include\libdivecomputer\ioctl.h" />
     <ClInclude Include="..\..\include\libdivecomputer\iostream.h" />
     <ClInclude Include="..\..\include\libdivecomputer\irda.h" />

@@ -24,10 +24,17 @@
  * downloaded oldest first, dives behind a deleted manifest record are kept,
  * and deleted records are left out of the progress maximum. Each change is
  * marked "DSCNT change" below.
+ *
+ * Changed by DSCNT on 30 October 2026 (scuba-network/app#1122): the caller can
+ * leave out dives it already has, by their fingerprint in the manifest, before
+ * their profiles are downloaded (shearwater_petrel_device_set_skip, in
+ * include/libdivecomputer/shearwater_petrel.h). Also marked "DSCNT change".
  */
 
 #include <string.h> // memcmp, memcpy
 #include <stdlib.h> // malloc, free
+
+#include <libdivecomputer/shearwater_petrel.h>
 
 #include "shearwater_petrel.h"
 #include "shearwater_common.h"
@@ -49,6 +56,9 @@
 typedef struct shearwater_petrel_device_t {
 	shearwater_common_device_t base;
 	unsigned char fingerprint[4];
+	// DSCNT change (#1122): asked which dives to leave out.
+	shearwater_petrel_skip_callback_t skip;
+	void *skip_userdata;
 } shearwater_petrel_device_t;
 
 static dc_status_t shearwater_petrel_device_set_fingerprint (dc_device_t *abstract, const unsigned char data[], unsigned int size);
@@ -102,6 +112,8 @@ shearwater_petrel_device_open (dc_device_t **out, dc_context_t *context, dc_iost
 
 	// Set the default values.
 	memset (device->fingerprint, 0, sizeof (device->fingerprint));
+	device->skip = NULL;
+	device->skip_userdata = NULL;
 
 	// Setup the device.
 	status = shearwater_common_setup (&device->base, context, iostream, model);
@@ -149,6 +161,21 @@ shearwater_petrel_device_set_fingerprint (dc_device_t *abstract, const unsigned 
 		memcpy (device->fingerprint, data, sizeof (device->fingerprint));
 	else
 		memset (device->fingerprint, 0, sizeof (device->fingerprint));
+
+	return DC_STATUS_SUCCESS;
+}
+
+
+dc_status_t
+shearwater_petrel_device_set_skip (dc_device_t *abstract, shearwater_petrel_skip_callback_t callback, void *userdata)
+{
+	shearwater_petrel_device_t *device = (shearwater_petrel_device_t *) abstract;
+
+	if (!ISINSTANCE (abstract))
+		return DC_STATUS_INVALIDARGS;
+
+	device->skip = callback;
+	device->skip_userdata = callback ? userdata : NULL;
 
 	return DC_STATUS_SUCCESS;
 }
@@ -238,12 +265,16 @@ shearwater_petrel_device_foreach (dc_device_t *abstract, dc_dive_callback_t call
 	}
 
 	// Allocate memory buffers for the manifests.
+	// DSCNT change (#1122): and one byte per manifest record, 1 for a dive
+	// the caller asked to leave out.
 	dc_buffer_t *buffer = dc_buffer_new (MANIFEST_SIZE);
 	dc_buffer_t *manifests = dc_buffer_new (MANIFEST_SIZE);
-	if (buffer == NULL || manifests == NULL) {
+	dc_buffer_t *skipped = dc_buffer_new (RECORD_COUNT);
+	if (buffer == NULL || manifests == NULL || skipped == NULL) {
 		ERROR (abstract->context, "Insufficient buffer space available.");
 		dc_buffer_free (buffer);
 		dc_buffer_free (manifests);
+		dc_buffer_free (skipped);
 		return DC_STATUS_NOMEMORY;
 	}
 
@@ -263,6 +294,7 @@ shearwater_petrel_device_foreach (dc_device_t *abstract, dc_dive_callback_t call
 			ERROR (abstract->context, "Failed to download the manifest.");
 			dc_buffer_free (buffer);
 			dc_buffer_free (manifests);
+			dc_buffer_free (skipped);
 			return rc;
 		}
 
@@ -273,13 +305,21 @@ shearwater_petrel_device_foreach (dc_device_t *abstract, dc_dive_callback_t call
 		unsigned int size = dc_buffer_get_size (buffer);
 
 		// Process the records in the manifest.
-		unsigned int count = 0, deleted = 0;
+		unsigned int count = 0, deleted = 0, known = 0;
 		unsigned int offset = 0;
 		while (offset < size) {
+			// DSCNT change (#1122): whether the caller has this dive. Every
+			// record the walk passes gets a byte, deleted ones too.
+			unsigned char skip = 0;
+
 			// Check for a valid dive header.
 			unsigned int header = array_uint16_be (data + offset);
 			if (header == 0x5A23) {
 				// this is a deleted dive; keep looking
+				if (!dc_buffer_append (skipped, &skip, 1)) {
+					rc = DC_STATUS_NOMEMORY;
+					break;
+				}
 				offset += RECORD_SIZE;
 				deleted++;
 				continue;
@@ -291,15 +331,34 @@ shearwater_petrel_device_foreach (dc_device_t *abstract, dc_dive_callback_t call
 			if (memcmp (data + offset + 4, device->fingerprint, sizeof (device->fingerprint)) == 0)
 				break;
 
+			// DSCNT change (#1122): ask the caller, before any profile is
+			// downloaded, whether it already has this dive.
+			if (device->skip && device->skip (data + offset + 4, sizeof (device->fingerprint), device->skip_userdata)) {
+				skip = 1;
+				known++;
+			}
+			if (!dc_buffer_append (skipped, &skip, 1)) {
+				rc = DC_STATUS_NOMEMORY;
+				break;
+			}
+
 			offset += RECORD_SIZE;
 			count++;
+		}
+		if (rc != DC_STATUS_SUCCESS) {
+			ERROR (abstract->context, "Insufficient buffer space available.");
+			dc_buffer_free (buffer);
+			dc_buffer_free (manifests);
+			dc_buffer_free (skipped);
+			return rc;
 		}
 
 		// Update the progress state.
 		// DSCNT change (#1109): deleted records are never downloaded, so
 		// they are left out of the maximum, which then ends at 100%.
+		// DSCNT change (#1122): so are the dives the caller already has.
 		current += 1;
-		maximum -= RECORD_COUNT - count;
+		maximum -= RECORD_COUNT - count + known;
 
 		// Append the manifest records to the main buffer.
 		// DSCNT change (#1109): append every record the walk passed, which
@@ -310,6 +369,7 @@ shearwater_petrel_device_foreach (dc_device_t *abstract, dc_dive_callback_t call
 			ERROR (abstract->context, "Insufficient buffer space available.");
 			dc_buffer_free (buffer);
 			dc_buffer_free (manifests);
+			dc_buffer_free (skipped);
 			return DC_STATUS_NOMEMORY;
 		}
 
@@ -326,6 +386,7 @@ shearwater_petrel_device_foreach (dc_device_t *abstract, dc_dive_callback_t call
 	// Cache the buffer pointer and size.
 	unsigned char *data = dc_buffer_get_data (manifests);
 	unsigned int size = dc_buffer_get_size (manifests);
+	const unsigned char *skips = dc_buffer_get_data (skipped);
 
 	// DSCNT change (#1109): download the dives oldest first. The manifests
 	// were read newest first, which the fingerprint check above needs, so
@@ -340,6 +401,11 @@ shearwater_petrel_device_foreach (dc_device_t *abstract, dc_dive_callback_t call
 		if (array_uint16_be (data + offset) == 0x5A23)
 			continue;
 
+		// DSCNT change (#1122): and the dives the caller already has. The
+		// manifest holds one record for each byte of skips, in order.
+		if (skips[offset / RECORD_SIZE])
+			continue;
+
 		// Get the address of the dive.
 		unsigned int address = array_uint32_be (data + offset + 20);
 
@@ -351,6 +417,7 @@ shearwater_petrel_device_foreach (dc_device_t *abstract, dc_dive_callback_t call
 			ERROR (abstract->context, "Failed to download the dive.");
 			dc_buffer_free (buffer);
 			dc_buffer_free (manifests);
+			dc_buffer_free (skipped);
 			return rc;
 		}
 
@@ -370,6 +437,7 @@ shearwater_petrel_device_foreach (dc_device_t *abstract, dc_dive_callback_t call
 
 	dc_buffer_free (manifests);
 	dc_buffer_free (buffer);
+	dc_buffer_free (skipped);
 
 	return rc;
 }

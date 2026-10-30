@@ -150,3 +150,4 @@ hw_ostc3_device_fwupdate
 atomics_cobalt_device_version
 atomics_cobalt_device_set_simulation
 divesystem_idive_device_fwupdate
+shearwater_petrel_device_set_skip

@@ -19,6 +19,13 @@
  * MA 02110-1301 USA
  */
 
+/*
+ * Changed by DSCNT on 30 October 2026 (scuba-network/app#1128): the receive
+ * timeout is 15 seconds instead of 3, and a dive's block that gets no answer
+ * is asked for again, twice at most, before the download fails. Each change
+ * is marked "DSCNT change" below.
+ */
+
 #include <string.h> // memcmp, memcpy
 #include <stdlib.h> // malloc, free
 
@@ -68,6 +75,15 @@
 
 #define NAK 0x7F
 
+// DSCNT change (#1128): how long to wait for the computer to answer, and how
+// many times to ask again for a block of a transfer that got no answer. A
+// Petrel 2 went silent for more than 3 seconds, mid-dive, once in every few
+// hundred dives, with the link still up. Giving up then also sent the command
+// that ends the session, after which it stopped answering until its Bluetooth
+// was switched off and on.
+#define TIMEOUT_MS     15000
+#define BLOCK_RETRIES  2
+
 dc_status_t
 shearwater_common_setup (shearwater_common_device_t *device, dc_context_t *context, dc_iostream_t *iostream, unsigned int model)
 {
@@ -82,8 +98,9 @@ shearwater_common_setup (shearwater_common_device_t *device, dc_context_t *conte
 		return status;
 	}
 
-	// Set the timeout for receiving data (3000ms).
-	status = dc_iostream_set_timeout (device->iostream, 3000);
+	// Set the timeout for receiving data.
+	// DSCNT change (#1128): 15000 ms instead of 3000 ms.
+	status = dc_iostream_set_timeout (device->iostream, TIMEOUT_MS);
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (context, "Failed to set the timeout.");
 		return status;
@@ -353,21 +370,15 @@ done:
 }
 
 
-dc_status_t
-shearwater_common_transfer (shearwater_common_device_t *device, const unsigned char input[], unsigned int isize, unsigned char output[], unsigned int osize, unsigned int *actual)
+// DSCNT change (#1128): shearwater_common_transfer is split in two, sending
+// and receiving, so that a late answer can be read without sending again.
+static dc_status_t
+shearwater_common_send (shearwater_common_device_t *device, const unsigned char input[], unsigned int isize)
 {
 	dc_status_t status = DC_STATUS_SUCCESS;
 	dc_device_t *abstract = (dc_device_t *) device;
-	const unsigned int maxpacket = (device->protocol == V2) ? SZ_PACKET_V2 : SZ_PACKET_V1;
 	const unsigned int headerlen = (device->protocol == V2) ? 5 : 4;
 	unsigned char packet[SZ_PACKET_MAX + 5];
-	unsigned int n = 0;
-
-	if (isize > maxpacket || osize > maxpacket)
-		return DC_STATUS_INVALIDARGS;
-
-	if (device_is_cancelled (abstract))
-		return DC_STATUS_CANCELLED;
 
 	// Setup the request packet.
 	packet[0] = 0xFF;
@@ -390,12 +401,18 @@ shearwater_common_transfer (shearwater_common_device_t *device, const unsigned c
 		return status;
 	}
 
-	// Return early if no response packet is requested.
-	if (osize == 0) {
-		if (actual)
-			*actual = 0;
-		return DC_STATUS_SUCCESS;
-	}
+	return DC_STATUS_SUCCESS;
+}
+
+
+static dc_status_t
+shearwater_common_receive (shearwater_common_device_t *device, unsigned char output[], unsigned int osize, unsigned int *actual)
+{
+	dc_status_t status = DC_STATUS_SUCCESS;
+	dc_device_t *abstract = (dc_device_t *) device;
+	const unsigned int headerlen = (device->protocol == V2) ? 5 : 4;
+	unsigned char packet[SZ_PACKET_MAX + 5];
+	unsigned int n = 0;
 
 	// Receive the response packet.
 	status = shearwater_common_slip_read (device, packet, sizeof (packet), &n);
@@ -432,6 +449,96 @@ shearwater_common_transfer (shearwater_common_device_t *device, const unsigned c
 	memcpy (output, packet + headerlen, length);
 	if (actual)
 		*actual = length;
+
+	return DC_STATUS_SUCCESS;
+}
+
+
+dc_status_t
+shearwater_common_transfer (shearwater_common_device_t *device, const unsigned char input[], unsigned int isize, unsigned char output[], unsigned int osize, unsigned int *actual)
+{
+	dc_status_t status = DC_STATUS_SUCCESS;
+	dc_device_t *abstract = (dc_device_t *) device;
+	const unsigned int maxpacket = (device->protocol == V2) ? SZ_PACKET_V2 : SZ_PACKET_V1;
+
+	if (isize > maxpacket || osize > maxpacket)
+		return DC_STATUS_INVALIDARGS;
+
+	if (device_is_cancelled (abstract))
+		return DC_STATUS_CANCELLED;
+
+	status = shearwater_common_send (device, input, isize);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	// Return early if no response packet is requested.
+	if (osize == 0) {
+		if (actual)
+			*actual = 0;
+		return DC_STATUS_SUCCESS;
+	}
+
+	return shearwater_common_receive (device, output, osize, actual);
+}
+
+
+// DSCNT change (#1128): whether a packet is the answer to a request that was
+// sent again: the block before the one asked for, or the computer refusing a
+// block request. Such an answer can arrive after the one that was used.
+static int
+shearwater_common_is_repeat (const unsigned char response[], unsigned int n, unsigned char previous)
+{
+	if (n >= 2 && response[0] == UPLOAD_DATA_RESPONSE && response[1] == previous)
+		return 1;
+	if (n >= 2 && response[0] == NAK && response[1] == UPLOAD_DATA_REQUEST)
+		return 1;
+	return 0;
+}
+
+
+// DSCNT change (#1128): one request of an upload, asked again when it gets no
+// answer (retries times at most), and with the late answers to an earlier
+// repeated request left out. *stale counts the repeated requests whose answers
+// may still arrive; previous is the block number such an answer carries.
+//
+// The protocol's requests are those of UDS (ISO 14229), whose Transfer Data
+// request may be repeated with the same block counter after a timeout; the
+// computer then sends that block again. A block request that had no answer
+// before the timeout is therefore asked for again, after the bytes waiting to
+// be read are thrown away. The command that ends the session is sent only
+// once every repeat has failed, by the caller, as before.
+static dc_status_t
+shearwater_common_upload_request (shearwater_common_device_t *device, const unsigned char request[], unsigned int isize, unsigned char response[], unsigned int *n, unsigned int retries, unsigned char previous, unsigned int *stale)
+{
+	dc_device_t *abstract = (dc_device_t *) device;
+	const unsigned int maxpacket = (device->protocol == V2) ? SZ_PACKET_V2 : SZ_PACKET_V1;
+	unsigned int repeated = 0;
+
+	dc_status_t rc = shearwater_common_transfer (device, request, isize, response, maxpacket, n);
+	while (1) {
+		if (rc == DC_STATUS_TIMEOUT && repeated < retries && !device_is_cancelled (abstract)) {
+			repeated++;
+			WARNING (abstract->context, "No answer to block %u; asking for it again (%u of %u).", request[1], repeated, retries);
+			dc_iostream_purge (device->iostream, DC_DIRECTION_INPUT);
+			rc = shearwater_common_transfer (device, request, isize, response, maxpacket, n);
+			continue;
+		}
+		if (rc != DC_STATUS_SUCCESS)
+			return rc;
+		if (*stale > 0 && shearwater_common_is_repeat (response, *n, previous)) {
+			// The answer to an earlier repeated request: read the next one.
+			(*stale)--;
+			if (device_is_cancelled (abstract))
+				return DC_STATUS_CANCELLED;
+			rc = shearwater_common_receive (device, response, maxpacket, n);
+			continue;
+		}
+		break;
+	}
+
+	// Answers arrive in the order asked, so any answer to an earlier repeated
+	// request has arrived by now. Only this request's repeats may follow.
+	*stale = repeated;
 
 	return DC_STATUS_SUCCESS;
 }
@@ -511,10 +618,12 @@ shearwater_common_download (shearwater_common_device_t *device, dc_buffer_t *buf
 	unsigned int done = 0;
 	unsigned char block = 1;
 	unsigned int nbytes = 0;
+	unsigned int stale = 0;
 	while (nbytes < size && !done) {
 		// Transfer the block request.
+		// DSCNT change (#1128): asked again when it gets no answer.
 		req_block[1] = block;
-		rc = shearwater_common_transfer (device, req_block, req_block_len, response, maxpacket, &n);
+		rc = shearwater_common_upload_request (device, req_block, req_block_len, response, &n, BLOCK_RETRIES, (unsigned char) (block - 1), &stale);
 		if (rc != DC_STATUS_SUCCESS) {
 			return rc;
 		}
@@ -563,7 +672,9 @@ shearwater_common_download (shearwater_common_device_t *device, dc_buffer_t *buf
 	}
 
 	// Transfer the quit request.
-	rc = shearwater_common_transfer (device, req_quit, sizeof (req_quit), response, maxpacket, &n);
+	// DSCNT change (#1128): a late answer to the last block, asked for again,
+	// is left out. The quit request itself is sent once.
+	rc = shearwater_common_upload_request (device, req_quit, sizeof (req_quit), response, &n, 0, (unsigned char) (block - 1), &stale);
 	if (rc != DC_STATUS_SUCCESS) {
 		return rc;
 	}
