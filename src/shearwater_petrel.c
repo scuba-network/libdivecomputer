@@ -20,10 +20,13 @@
  */
 
 /*
- * Changed by DSCNT on 29 October 2026 (scuba-network/app#1109): dives are
- * downloaded oldest first, dives behind a deleted manifest record are kept,
- * and deleted records are left out of the progress maximum. Each change is
- * marked "DSCNT change" below.
+ * Changed by DSCNT on 29 October 2026 (scuba-network/app#1109): dives behind
+ * a deleted manifest record are kept, and deleted records are left out of the
+ * progress maximum. Each change is marked "DSCNT change" below. That change
+ * also downloaded the dives oldest first; on 31 October 2026
+ * (scuba-network/app#1123) they are downloaded newest first again, as
+ * upstream does, because the caller now resumes by leaving out the dives it
+ * already has.
  *
  * Changed by DSCNT on 30 October 2026 (scuba-network/app#1122): the caller can
  * leave out dives it already has, by their fingerprint in the manifest, before
@@ -388,15 +391,14 @@ shearwater_petrel_device_foreach (dc_device_t *abstract, dc_dive_callback_t call
 	unsigned int size = dc_buffer_get_size (manifests);
 	const unsigned char *skips = dc_buffer_get_data (skipped);
 
-	// DSCNT change (#1109): download the dives oldest first. The manifests
-	// were read newest first, which the fingerprint check above needs, so
-	// they are walked here from the end. A download that stops part way has
-	// then delivered the oldest dives without a gap, and the newest of them
-	// is a safe place for the next download to stop at.
-	unsigned int offset = size;
-	while (offset >= RECORD_SIZE) {
-		offset -= RECORD_SIZE;
-
+	// DSCNT change (#1123): the dives are downloaded newest first again, in
+	// manifest order, as upstream does; #1109 had made it oldest first. A
+	// download that stops part way now holds the newest dives, the ones a
+	// diver cares about most, and the next download carries on by leaving out
+	// the dives already received (shearwater_petrel_device_set_skip) rather
+	// than by stopping at one.
+	unsigned int offset = 0;
+	for (; offset < size; offset += RECORD_SIZE) {
 		// Skip deleted dives.
 		if (array_uint16_be (data + offset) == 0x5A23)
 			continue;
